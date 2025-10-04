@@ -4,12 +4,16 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 contract KipuBank is Ownable, ReentrancyGuard {
     IERC20 public token;
     uint256 public immutable bankCap; // <-- Límite global de depósitos (inmutable)
     uint256 public totalDeposits;     // <-- Balance total del contrato (para validar bankCap)
-
+    
+    // Chainlink ETH/USD Price Feed
+    AggregatorV3Interface internal ethUsdPriceFeed;
+    
     // Contadores globales
     uint256 public totalDepositsCount;  // Total de depósitos en el contrato
     uint256 public totalWithdrawalsCount; // Total de retiros en el contrato
@@ -36,13 +40,23 @@ contract KipuBank is Ownable, ReentrancyGuard {
     event LockPeriodUpdated(uint256 newLockPeriod);
     event TokenAddressUpdated(address newTokenAddress);
     event BankCapSet(uint256 cap);
+    event PriceFeedUpdated(address newPriceFeed);
 
-    constructor(address _tokenAddress, uint256 _bankCap) Ownable(msg.sender) {
+    constructor(
+        address _tokenAddress, 
+        uint256 _bankCap, 
+        address _priceFeedAddress
+    ) Ownable(msg.sender) {
         require(_tokenAddress != address(0), "Token address cannot be zero");
         require(_bankCap > 0, "Bank cap must be greater than 0");
+        require(_priceFeedAddress != address(0), "Price feed address cannot be zero");
+        
         token = IERC20(_tokenAddress);
         bankCap = _bankCap;
+        ethUsdPriceFeed = AggregatorV3Interface(_priceFeedAddress);
+        
         emit BankCapSet(_bankCap);
+        emit PriceFeedUpdated(_priceFeedAddress);
     }
 
     function createAccount() external {
@@ -62,8 +76,13 @@ contract KipuBank is Ownable, ReentrancyGuard {
     function deposit(uint256 amount) external nonReentrant {
         require(accounts[msg.sender].exists, "Account does not exist");
         require(amount >= minimumDeposit, "Amount below minimum deposit");
+        
+        // Convert amount to USD value for bank cap check
+        uint256 amountInUsd = getTokenAmountInUsd(amount);
+        uint256 totalDepositsInUsd = getTokenAmountInUsd(totalDeposits);
+        
         require(
-            totalDeposits + amount <= bankCap,
+            totalDepositsInUsd + amountInUsd <= bankCap,
             "Deposit would exceed bank capacity"
         );
 
@@ -130,6 +149,30 @@ contract KipuBank is Ownable, ReentrancyGuard {
         return accounts[accountOwner].balance;
     }
 
+    function getLatestEthPrice() public view returns (uint256) {
+        (, int256 price, , , ) = ethUsdPriceFeed.latestRoundData();
+        require(price > 0, "Invalid price");
+        // Price from Chainlink is with 8 decimals
+        return uint256(price);
+    }
+    
+    function getTokenAmountInUsd(uint256 tokenAmount) public view returns (uint256) {
+        uint256 ethPrice = getLatestEthPrice();
+        // Assuming 1 token = 1 ETH for simplicity
+        // In a real scenario, you would need to get the token/ETH exchange rate
+        // Convert to USD with 8 decimals precision (same as Chainlink price feed)
+        return (tokenAmount * ethPrice) / 10**18;
+    }
+    
+    function getTotalDepositsInUsd() external view returns (uint256) {
+        return getTokenAmountInUsd(totalDeposits);
+    }
+    
+    function getAccountBalanceInUsd(address accountOwner) external view returns (uint256) {
+        require(accounts[accountOwner].exists, "Account does not exist");
+        return getTokenAmountInUsd(accounts[accountOwner].balance);
+    }
+
     function setMinimumDeposit(uint256 _minimumDeposit) external onlyOwner {
         minimumDeposit = _minimumDeposit;
         emit MinimumDepositUpdated(_minimumDeposit);
@@ -150,6 +193,12 @@ contract KipuBank is Ownable, ReentrancyGuard {
         require(_tokenAddress != address(0), "Token address cannot be zero");
         token = IERC20(_tokenAddress);
         emit TokenAddressUpdated(_tokenAddress);
+    }
+    
+    function setPriceFeed(address _priceFeedAddress) external onlyOwner {
+        require(_priceFeedAddress != address(0), "Price feed address cannot be zero");
+        ethUsdPriceFeed = AggregatorV3Interface(_priceFeedAddress);
+        emit PriceFeedUpdated(_priceFeedAddress);
     }
 
     function withdrawFees() external onlyOwner {
